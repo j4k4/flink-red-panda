@@ -3,148 +3,13 @@
 I've created this repository in the context of testing the interoperability of Apache Flink and Red Panda. 
 In some sense, it is also summarizes the capabilities of Apache Flink's Apache Kafka Connector. 
 
-## Summary
-
-- :heavy_check_mark: Reading & Writing Value *and* Key with different formats  
-- :heavy_check_mark: Reading & Writing Metadata (Headers, Offset)
-- :heavy_check_mark: `upsert-kafka` & `kafka` Connector
-- :x: Writing Exactly-Once Transactions
-- :question: Integration with Schema Registry
-
 ## Environment Setup
-
+This starts a local environment running consisting of Red Panda, a Flink Cluster and a SQL Client to submit Flink SQL queries to the Flink Cluster.
 ```
 docker-compose up -d
-```
-This starts a local environment running consisting of Red Panda, a Flink Cluster and a SQL Client to submit Flink SQL queries to the Flink Cluster.
-
-``
 docker-compose run sql-client
-``
-
-Opens the SQL Client.
-
-The Flink UI is available under http://localhost:8081, where you should be able to see the running Jobs and be able to cancel them.
-
-## Example Queries
-
-### Reading & Writing Value and Key
-
-```sql
-/* Test Data Generator */
-CREATE TABLE animal_sightings (
-  `timestamp` TIMESTAMP(3),
-   `name` STRING,
-   `country` STRING,
-   `number` INT
-) WITH (
-  'connector' = 'faker', 
-  'fields.name.expression' = '#{animal.name}',
-  'fields.country.expression' = '#{country.name}',
-  'fields.number.expression' = '#{number.numberBetween ''0'',''1000''}',
-  'fields.timestamp.expression' = '#{date.past ''15'',''SECONDS''}'
-);
-
-CREATE TABLE animal_sightings_panda (
-  `timestamp` TIMESTAMP(3),
-   `name` STRING,
-   `country` STRING,
-   `number` INT
-)WITH (
-   'connector' = 'kafka',
-   'topic' = 'animal_sightings',
-   'properties.bootstrap.servers' = 'redpanda:29092',
-   'scan.startup.mode' = 'earliest-offset',
-
-   'key.format' = 'json',
-   'key.json.ignore-parse-errors' = 'true',
-   'key.fields' = 'name',
-   
-   'value.format' = 'json',
-   'value.json.fail-on-missing-field' = 'false',
-   'value.fields-include' = 'ALL'
-);
-
-/* Write into Red Panda */
-INSERT INTO animal_sightings_panda SELECT * FROM animal_sightings;
-
-/* See if it works by reading from the Red Panda topic */
-SELECT * FROM animal_sightings_panda;
 ```
-
-### Reading Metadata
-
-This assumes that `animal_sightings` is already being written to e.g. by the query from the previous example.
-
-```sql
-CREATE TABLE animal_sightings_with_metadata (
-  `name` STRING,
-  `country` STRING,
-  `number` INT,
-  `append_time` TIMESTAMP(3) METADATA FROM 'timestamp',
-  `partition` BIGINT METADATA VIRTUAL,
-  `offset` BIGINT METADATA VIRTUAL,
-  `headers` MAP<STRING, BYTES> METADATA,
-  `timestamp-type` STRING METADATA,
-  `leader-epoch` INT METADATA,
-  `topic` STRING METADATA
-) WITH (
-   'connector' = 'kafka',
-   'topic' = 'animal_sightings',
-   'properties.bootstrap.servers' = 'redpanda:29092',
-   'format' = 'json', 
-   'scan.startup.mode' = 'earliest-offset'
-);
-
-SELECT * FROM animal_sightings_with_metadata;
-
-```
-
-### Writing & Reading Compacted Topics (with Upsert Semantics)
-
-```sql
-/* Test Data Generator */ 
-CREATE TABLE animal_sightings (
-  `timestamp` TIMESTAMP(3),
-   `name` STRING,
-   `country` STRING,
-   `number` INT
-) WITH (
-  'connector' = 'faker', 
-  'fields.name.expression' = '#{animal.name}',
-  'fields.country.expression' = '#{country.name}',
-  'fields.number.expression' = '#{number.numberBetween ''0'',''1000''}',
-  'fields.timestamp.expression' = '#{date.past ''15'',''SECONDS''}'
-);
-
-/* Define Red Panda-backed table for total sightings */ 
- CREATE TABLE animal_sightings_total (
-   `name` STRING,
-   `total_number` BIGINT,
-    PRIMARY KEY (name) NOT ENFORCED
-)WITH (
-   'connector' = 'upsert-kafka',
-   'topic' = 'animal_sightings_total',
-   'properties.bootstrap.servers' = 'redpanda:29092',
-   'key.format' = 'json',
-   'value.format' = 'json'
-);
-
-/* Submit query to continuously derive totals */
-INSERT INTO animal_sightings_total 
-SELECT 
-  name, 
-  SUM(number) AS total_number
- FROM 
-   animal_sightings
- GROUP BY 
-  name;
-
-/* Read totals from Red Panda */
-SELECT * FROM animal_sightings_total;
-```
-
-### Writing Exactly-Once to Red Panda with Transactions ~~(fails)~~
+## Writing Exactly-Once to Red Panda with Transactions ~~(fails)~~
 
 ```sql
 /* enable checkpointing on the Flink side */
@@ -174,7 +39,7 @@ CREATE TABLE animal_sightings_panda_txn (
    'topic' = 'animal_sightings_txn',
    'properties.bootstrap.servers' = 'redpanda:29092',
    'format' = 'json', 
-   'scan.startup.mode' = 'earliest-offset',
+   'scan.startup.mode' = 'latest-offset',
    'sink.delivery-guarantee' = 'exactly-once',
    'sink.transactional-id-prefix' =  'flink',
    'properties.max.in.flight.requests.per.connection'='1'
@@ -185,33 +50,44 @@ INSERT INTO animal_sightings_panda_txn SELECT * FROM animal_sightings;
 /* See if it works by reading from the Red Panda topic */
 SELECT * FROM animal_sightings_panda_txn;
 ```
-Checking the Flink UI under https://localhost:8081 will now show that the Job is working correctly: 
 
+### check that the job is running 
+- Checking the Flink UI under https://localhost:8081 will now show that the Job is working correctly:
+  - there should be no exceptions
+  - you should see data being written
+  - you should see successful checkpoints
+
+### enforce a recovery from checkpoint
+- Run `docker-compose restart taskmanager` to restart the taskmanger. This will also restart and recover the job.
+- The job should be switching its state between running to restarting all the time. Unable to recover and throws exceptions like. You should see this in the exception overview in the Flink UI of the job.
 ```
-org.apache.flink.util.FlinkRuntimeException: Failed to send data to Kafka animal_sightings_txn-0@-1 with FlinkKafkaInternalProducer{transactionalId='flink-0-3', inTransaction=true, closed=false} 
-	at org.apache.flink.connector.kafka.sink.KafkaWriter$WriterCallback.throwException(KafkaWriter.java:405)
-	at org.apache.flink.connector.kafka.sink.KafkaWriter$WriterCallback.lambda$onCompletion$0(KafkaWriter.java:391)
-	at org.apache.flink.streaming.runtime.tasks.StreamTaskActionExecutor$1.runThrowing(StreamTaskActionExecutor.java:50)
-	at org.apache.flink.streaming.runtime.tasks.mailbox.Mail.run(Mail.java:90)
-	at org.apache.flink.streaming.runtime.tasks.mailbox.MailboxProcessor.processMailsNonBlocking(MailboxProcessor.java:353)
-	at org.apache.flink.streaming.runtime.tasks.mailbox.MailboxProcessor.processMail(MailboxProcessor.java:317)
-	at org.apache.flink.streaming.runtime.tasks.mailbox.MailboxProcessor.runMailboxLoop(MailboxProcessor.java:201)
-	at org.apache.flink.streaming.runtime.tasks.StreamTask.runMailboxLoop(StreamTask.java:809)
-	at org.apache.flink.streaming.runtime.tasks.StreamTask.invoke(StreamTask.java:761)
-	at org.apache.flink.runtime.taskmanager.Task.runWithSystemExitMonitoring(Task.java:958)
-	at org.apache.flink.runtime.taskmanager.Task.restoreAndInvoke(Task.java:937)
-	at org.apache.flink.runtime.taskmanager.Task.doRun(Task.java:766)
-	at org.apache.flink.runtime.taskmanager.Task.run(Task.java:575)
-	at java.lang.Thread.run(Thread.java:750)
-Caused by: org.apache.flink.kafka.shaded.org.apache.kafka.common.errors.OutOfOrderSequenceException: The broker received an out of order sequence number.
+java.lang.IllegalStateException: Failed to commit KafkaCommittable{producerId=282, epoch=0, transactionalId=flink-0-274}
+	at org.apache.flink.streaming.runtime.operators.sink.committables.CommitRequestImpl.signalFailedWithUnknownReason(CommitRequestImpl.java:77)
+	at org.apache.flink.connector.kafka.sink.KafkaCommitter.commit(KafkaCommitter.java:119)
+	at org.apache.flink.streaming.runtime.operators.sink.committables.CheckpointCommittableManagerImpl.commit(CheckpointCommittableManagerImpl.java:126)
+	at org.apache.flink.streaming.runtime.operators.sink.CommitterOperator.commitAndEmit(CommitterOperator.java:176)
+	at org.apache.flink.streaming.runtime.operators.sink.CommitterOperator.commitAndEmitCheckpoints(CommitterOperator.java:160)
+	at org.apache.flink.streaming.runtime.operators.sink.CommitterOperator.initializeState(CommitterOperator.java:121)
+	at org.apache.flink.streaming.api.operators.StreamOperatorStateHandler.initializeOperatorState(StreamOperatorStateHandler.java:122)
+	at org.apache.flink.streaming.api.operators.AbstractStreamOperator.initializeState(AbstractStreamOperator.java:283)
+	at org.apache.flink.streaming.runtime.tasks.RegularOperatorChain.initializeStateAndOpenOperators(RegularOperatorChain.java:106)
+	at org.apache.flink.streaming.runtime.tasks.StreamTask.restoreGates(StreamTask.java:726)
+	at org.apache.flink.streaming.runtime.tasks.StreamTaskActionExecutor$1.call(StreamTaskActionExecutor.java:55)
+	at org.apache.flink.streaming.runtime.tasks.StreamTask.restoreInternal(StreamTask.java:702)
+	at org.apache.flink.streaming.runtime.tasks.StreamTask.restore(StreamTask.java:669)
+	at org.apache.flink.runtime.taskmanager.Task.runWithSystemExitMonitoring(Task.java:935)
+	at org.apache.flink.runtime.taskmanager.Task.restoreAndInvoke(Task.java:904)
+	at org.apache.flink.runtime.taskmanager.Task.doRun(Task.java:728)
+	at org.apache.flink.runtime.taskmanager.Task.run(Task.java:550)
+	at java.base/java.lang.Thread.run(Unknown Source)
+Caused by: org.apache.flink.kafka.shaded.org.apache.kafka.common.KafkaException: Unhandled error in EndTxnResponse: The server experienced an unexpected error when processing the request.
+	at org.apache.flink.kafka.shaded.org.apache.kafka.clients.producer.internals.TransactionManager$EndTxnHandler.handleResponse(TransactionManager.java:1646)
+	at org.apache.flink.kafka.shaded.org.apache.kafka.clients.producer.internals.TransactionManager$TxnRequestHandler.onComplete(TransactionManager.java:1322)
+	at org.apache.flink.kafka.shaded.org.apache.kafka.clients.ClientResponse.onComplete(ClientResponse.java:109)
+	at org.apache.flink.kafka.shaded.org.apache.kafka.clients.NetworkClient.completeResponses(NetworkClient.java:583)
+	at org.apache.flink.kafka.shaded.org.apache.kafka.clients.NetworkClient.poll(NetworkClient.java:575)
+	at org.apache.flink.kafka.shaded.org.apache.kafka.clients.producer.internals.Sender.maybeSendAndPollTransactionalRequest(Sender.java:418)
+	at org.apache.flink.kafka.shaded.org.apache.kafka.clients.producer.internals.Sender.runOnce(Sender.java:316)
+	at org.apache.flink.kafka.shaded.org.apache.kafka.clients.producer.internals.Sender.run(Sender.java:243)
+	... 1 more
 ```
-
-This is tracked in https://github.com/redpanda-data/redpanda/issues/4029. 
-
-### Changelog since the issue at Redpanda was opened
-
-1. Flink was updated from Flink 1.14.4 to Flink 1.16.0
-   1. The Kafka Clients version was upgraded from 2.4.1 https://github.com/apache/flink/blob/release-1.14.4/flink-connectors/flink-connector-kafka/pom.xml#L39 to 3.2.3 https://github.com/apache/flink/blob/release-1.16.0/flink-connectors/flink-connector-kafka/pom.xml#L38
-   2. The Flink Kafka Connector was ported to the new SinkV2 API of Flink
-   3. A complete diff can be retrieved by checking out the Flink repo and all its tags and then run a `git diff release-1.14.4 release-1.16.0 -- flink-connectors/flink-connector-kafka`
-2. Redpanda was updated from v21.11.4 to v22.2.2
