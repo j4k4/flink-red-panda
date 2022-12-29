@@ -29,26 +29,48 @@ CREATE TABLE animal_sightings (
   'fields.timestamp.expression' = '#{date.past ''15'',''SECONDS''}'
 );
 
+/* Create table which is connected to red panda */
 CREATE TABLE animal_sightings_panda_txn (
-   `timestamp` TIMESTAMP(3) METADATA,
-   `name` STRING,
-   `country` STRING,
-   `number` INT
+  `timestamp` TIMESTAMP(3) METADATA,
+  `name` STRING,
+  `country` STRING,
+  `number` INT
 ) WITH (
-   'connector' = 'kafka',
-   'topic' = 'animal_sightings_txn',
-   'properties.bootstrap.servers' = 'redpanda:29092',
-   'format' = 'json', 
-   'scan.startup.mode' = 'latest-offset',
-   'sink.delivery-guarantee' = 'exactly-once',
-   'sink.transactional-id-prefix' =  'flink',
-   'properties.max.in.flight.requests.per.connection'='1'
+  'connector' = 'kafka',
+  'topic' = 'animal_sightings_txn',
+  'properties.bootstrap.servers' = 'redpanda:29092',
+  'format' = 'json', 
+  'scan.startup.mode' = 'latest-offset',
+  'sink.delivery-guarantee' = 'exactly-once',
+  'sink.transactional-id-prefix' =  'flink',
+  'properties.max.in.flight.requests.per.connection'='1'
 );
 
-INSERT INTO animal_sightings_panda_txn SELECT * FROM animal_sightings;
+/* Create table which is connected to kafka */
+CREATE TABLE animal_sightings_kafka_txn (
+  `timestamp` TIMESTAMP(3) METADATA,
+  `name` STRING,
+  `country` STRING,
+  `number` INT
+) WITH (
+  'connector' = 'kafka',
+  'topic' = 'animal_sightings_txn',
+  'properties.bootstrap.servers' = 'kafka:29092',
+  'format' = 'json',
+  'scan.startup.mode' = 'latest-offset',
+  'sink.delivery-guarantee' = 'exactly-once',
+  'sink.transactional-id-prefix' =  'flink',
+  'properties.max.in.flight.requests.per.connection'='1',
+  'properties.transaction.timeout.ms'='1000'
+);
 
-/* See if it works by reading from the Red Panda topic */
+/* Write data to red panda and kafka */
+INSERT INTO animal_sightings_panda_txn SELECT * FROM animal_sightings;
+INSERT INTO animal_sightings_kafka_txn SELECT * FROM animal_sightings;
+
+/* See if it works by reading from the red panda and kafka topic */
 SELECT * FROM animal_sightings_panda_txn;
+SELECT * FROM animal_sightings_kafka_txn;
 ```
 
 ### check that the job is running 
